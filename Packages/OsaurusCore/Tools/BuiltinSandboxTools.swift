@@ -509,6 +509,19 @@ internal func sandboxBridgeRead(
     return normalizedFileEnvelope(raw, tool: "file_read", payloadKey: "content", emptyText: "(empty file)")
 }
 
+/// Whole-file sandbox read for `file_write`'s `source_path` on the
+/// `/workspace` route: the same `SandboxReadFileTool` `file_read` uses for
+/// text under `/workspace` (VM path sanitizer, agent-user permissions), in
+/// its `max_chars: 0` whole-file mode (plain `cat`) so nothing is truncated.
+/// Returns the reader's raw envelope; the caller re-attributes failures.
+internal func sandboxBridgeReadWholeFile(
+    _ bridge: SandboxReadBridge,
+    path: String
+) async throws -> String {
+    try await SandboxReadFileTool(agentName: bridge.agentName, home: bridge.home)
+        .execute(argumentsJSON: encodeBridgeArgs(["path": path, "max_chars": 0]))
+}
+
 /// List a sandbox directory for a combined-mode `file_read("/workspace/...")`
 /// call on a directory path. Uses a depth-bounded `find` so `max_depth` is
 /// honored (the filename-search tool can't bound depth) and returns a

@@ -424,6 +424,97 @@ struct FileWriteDocumentFormatsTests {
         #expect(text.contains("Launch Plan"))
     }
 
+    // MARK: - source_path confinement (same gates as file_read)
+
+    private func failureIsNonRetryableSourcePathRejection(_ result: String) -> Bool {
+        guard ToolEnvelope.isError(result),
+            let data = result.data(using: .utf8),
+            let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return false }
+        return dict["field"] as? String == "source_path" && dict["retryable"] as? Bool == false
+    }
+
+    /// `source_path` is a read, so it is confined exactly like `file_read`'s
+    /// `path` (`FolderToolHelpers.resolvePath`): an absolute path outside the
+    /// working folder, a `..` escape, and an in-folder symlink whose target
+    /// is outside are all rejected before any byte is read, and nothing is
+    /// written. A symlink that stays inside the folder is an ordinary file.
+    @Test func sourcePathIsConfinedToTheWorkingFolder() async throws {
+        DocumentAdaptersBootstrap.registerBuiltIns()
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let outside = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: outside) }
+        let secret = outside.appendingPathComponent("id_rsa.md")
+        try "PRIVATE KEY MATERIAL".write(to: secret, atomically: true, encoding: .utf8)
+        let outputURL = root.appendingPathComponent("leak.docx")
+
+        // 1. Absolute path outside the folder.
+        let absolute = try await write(root, ["path": "leak.docx", "source_path": secret.path])
+        #expect(failureIsNonRetryableSourcePathRejection(absolute), "absolute escape accepted: \(absolute)")
+        #expect(!FileManager.default.fileExists(atPath: outputURL.path))
+
+        // 2. `..` traversal to the same file.
+        let traversal = try await write(
+            root,
+            ["path": "leak.docx", "source_path": "../\(outside.lastPathComponent)/id_rsa.md"]
+        )
+        #expect(failureIsNonRetryableSourcePathRejection(traversal), "traversal accepted: \(traversal)")
+        #expect(!FileManager.default.fileExists(atPath: outputURL.path))
+
+        // 3. A benign-looking symlink INSIDE the folder pointing OUTSIDE it.
+        let escapingLink = root.appendingPathComponent("notes.md")
+        try FileManager.default.createSymbolicLink(at: escapingLink, withDestinationURL: secret)
+        let viaLink = try await write(root, ["path": "leak.docx", "source_path": "notes.md"])
+        #expect(failureIsNonRetryableSourcePathRejection(viaLink), "escaping symlink accepted: \(viaLink)")
+        #expect(!FileManager.default.fileExists(atPath: outputURL.path))
+
+        // 4. A symlink inside the folder pointing at a file inside it is fine.
+        let real = root.appendingPathComponent("docs/real.md")
+        try FileManager.default.createDirectory(at: real.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "# Inside\n\nStays inside the folder.\n".write(to: real, atomically: true, encoding: .utf8)
+        let innerLink = root.appendingPathComponent("inside.md")
+        try FileManager.default.createSymbolicLink(at: innerLink, withDestinationURL: real)
+        let ok = try await write(root, ["path": "inside.docx", "source_path": "inside.md"])
+        #expect(ToolEnvelope.isSuccess(ok), "in-folder symlink refused: \(ok)")
+        let readBack = try await read(root, "inside.docx")
+        let text = (EnvelopeAssertions.successPayload(readBack)?["text"] as? String) ?? ""
+        #expect(text.contains("Stays inside the folder"))
+
+        // 5. The output path itself is still confined (unchanged behaviour:
+        //    the resolver throws and the registry boundary turns that into
+        //    the standard envelope).
+        await #expect(throws: FolderToolError.self) {
+            _ = try await write(root, ["path": "../escape.docx", "source_path": "inside.md"])
+        }
+        #expect(!FileManager.default.fileExists(atPath: outside.appendingPathComponent("escape.docx").path))
+    }
+
+    /// In combined read-only host mode `file_read` refuses secret files;
+    /// `source_path` goes through the same `shouldRefuseSecret` gate and the
+    /// same `rejected` envelope, so a document cannot be used to pull `.env`
+    /// into the workspace output.
+    @Test func sourcePathRefusesSecretFilesLikeFileRead() async throws {
+        DocumentAdaptersBootstrap.registerBuiltIns()
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try "API_KEY=sk-live-123\n".write(
+            to: root.appendingPathComponent(".env"), atomically: true, encoding: .utf8)
+
+        let (writeResult, readResult) = try await ChatExecutionContext.$hostReadOnlyScope.withValue(root) {
+            let w = try await write(root, ["path": "config.docx", "source_path": ".env"])
+            let r = try await read(root, ".env")
+            return (w, r)
+        }
+        #expect(ToolEnvelope.isError(writeResult), "\(writeResult)")
+        #expect(EnvelopeAssertions.failureKind(writeResult) == "rejected")
+        #expect(EnvelopeAssertions.failureKind(readResult) == "rejected", "file_read should refuse the same file")
+        let data = try #require(writeResult.data(using: .utf8))
+        let dict = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        #expect(dict["retryable"] as? Bool == false)
+        #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("config.docx").path))
+    }
+
     /// A generated document is bytes, not text: pointing `source_path` at
     /// one is refused with the text-file pivot instead of rendering ZIP
     /// bytes as Markdown.

@@ -1098,6 +1098,70 @@ struct BuiltinSandboxToolsTests {
         #expect(appendPrintfs.allSatisfy { $0.contains(" >> '") })
     }
 
+    /// WRITABLE combined mode: a `/workspace/...` `file_write` with
+    /// `source_path` reads the source through the sandbox's own reader
+    /// (`SandboxReadFileTool`, whole-file `cat`) — the same route `file_read`
+    /// takes for text under `/workspace` — so the VM sanitizer and the agent
+    /// user's permissions apply. Nothing is read from the VirtioFS share
+    /// host-side, and the text then lands through the ordinary shell write.
+    @Test @MainActor
+    func combinedMode_fileWrite_sourcePathReadsThroughSandboxReader() async throws {
+        let runner = MockSandboxToolCommandRunner(
+            rootResults: [],
+            agentResults: [
+                .init(stdout: "# Hello\n\nFrom the VM.\n", stderr: "", exitCode: 0),  // cat source
+                .init(stdout: "0\n", stderr: "", exitCode: 0),  // readForDiff: no prior file
+                .init(stdout: "", stderr: "", exitCode: 0),  // mkdir -p
+                .init(stdout: "", stderr: "", exitCode: 0),  // printf write
+            ]
+        )
+        let bridge = SandboxReadBridge(agentName: "test-agent", home: "/workspace/agents/test-agent")
+        let hostRoot = URL(fileURLWithPath: "/tmp/osaurus-combined-source-\(UUID().uuidString)")
+
+        let output = try await withRegisteredSandboxTools(runner: runner) {
+            try await ChatExecutionContext.$sandboxReadBridge.withValue(bridge) {
+                try await FileWriteTool(rootPath: hostRoot).execute(
+                    argumentsJSON:
+                        #"{"path":"/workspace/agents/test-agent/out.md","source_path":"/workspace/agents/test-agent/in.md"}"#
+                )
+            }
+        }
+        let payload = try successPayload(output)
+        #expect(payload["path"] as? String == "/workspace/agents/test-agent/out.md")
+
+        let commands = (await runner.calls).compactMap { call -> String? in
+            guard case .agent(_, let c) = call else { return nil }
+            return c
+        }
+        #expect(commands.first == "cat '/workspace/agents/test-agent/in.md'", "\(commands)")
+        #expect(commands.contains { $0.hasPrefix("printf '%s' '# Hello\n\nFrom the VM.\n'") }, "\(commands)")
+    }
+
+    /// A `source_path` the sandbox sanitizer rejects (outside the agent home
+    /// and `/workspace/shared`) is refused before any command runs, with the
+    /// reader's own verdict re-attributed to `file_write` / `source_path`.
+    @Test @MainActor
+    func combinedMode_fileWrite_sourcePathOutsideAgentHomeIsRefused() async throws {
+        let runner = MockSandboxToolCommandRunner(rootResults: [], agentResults: [])
+        let bridge = SandboxReadBridge(agentName: "test-agent", home: "/workspace/agents/test-agent")
+        let hostRoot = URL(fileURLWithPath: "/tmp/osaurus-combined-source-\(UUID().uuidString)")
+
+        let output = try await withRegisteredSandboxTools(runner: runner) {
+            try await ChatExecutionContext.$sandboxReadBridge.withValue(bridge) {
+                try await FileWriteTool(rootPath: hostRoot).execute(
+                    argumentsJSON:
+                        #"{"path":"/workspace/agents/test-agent/out.md","source_path":"/etc/passwd"}"#
+                )
+            }
+        }
+        let payload = try failurePayload(output)
+        #expect(payload["tool"] as? String == "file_write")
+        #expect(payload["field"] as? String == "source_path")
+        #expect(payload["retryable"] as? Bool == false)
+        let calls = await runner.calls
+        #expect(calls.isEmpty, "a rejected source_path must not run any sandbox command")
+    }
+
     @Test func shellWriteParts_preserveContentAndCharacterBoundaries() {
         #expect(SandboxWriteFileTool.shellWriteParts("") == [""])
         #expect(SandboxWriteFileTool.shellWriteParts("small") == ["small"])

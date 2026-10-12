@@ -2498,30 +2498,10 @@ struct FileWriteTool: OsaurusTool, PermissionedTool {
             let bridge = ChatExecutionContext.sandboxReadBridge
         {
             if let sourcePath {
-                // The source file lives in the VM; the host can read it only
-                // where the VirtioFS share exposes it.
-                guard let absolute = WorkspaceShareRoute.absoluteSandboxPath(sourcePath, home: bridge.home),
-                    let shareRelative = WorkspaceShareRoute.shareRelativePath(forSandboxPath: absolute),
-                    !shareRelative.isEmpty
-                else {
-                    return ToolEnvelope.failure(
-                        kind: .invalidArgs,
-                        message:
-                            "`source_path` '\(sourcePath)' is not under the `\(WorkspaceShareRoute.mountPoint)` share, so "
-                            + "the host cannot read it. Pass a `source_path` under `\(WorkspaceShareRoute.mountPoint)/...` "
-                            + "or pass the text as `content`.",
-                        field: "source_path",
-                        expected: "a text file under `\(WorkspaceShareRoute.mountPoint)/...`",
-                        tool: name,
-                        retryable: false
-                    )
-                }
-                switch try Self.contentFromSource(
-                    shareRelative,
-                    displayPath: sourcePath,
-                    rootPath: WorkspaceShareRoute.shareRoot,
-                    tool: name
-                ) {
+                // The source lives in the VM: read it through the sandbox's
+                // own reader (the route `file_read` takes for text under
+                // `/workspace`), never host-side on the model's behalf.
+                switch try await Self.contentFromSandboxSource(sourcePath, bridge: bridge, tool: name) {
                 case .text(let text): content = text
                 case .failureEnvelope(let envelope): return envelope
                 }
@@ -2571,12 +2551,7 @@ struct FileWriteTool: OsaurusTool, PermissionedTool {
             )
         }
         if let sourcePath {
-            switch try Self.contentFromSource(
-                sourcePath,
-                displayPath: sourcePath,
-                rootPath: rootPath,
-                tool: name
-            ) {
+            switch Self.contentFromSource(sourcePath, rootPath: rootPath, tool: name) {
             case .text(let text): content = text
             case .failureEnvelope(let envelope): return envelope
             }
@@ -2703,17 +2678,45 @@ struct FileWriteTool: OsaurusTool, PermissionedTool {
         case failureEnvelope(String)
     }
 
-    /// The `content` a `source_path` supplies: the UTF-8 text of an existing
-    /// file under `rootPath`. A missing file, a generated document (whose
-    /// bytes are not text) or non-UTF-8 data comes back as the envelope to
-    /// return — each names the fix, none is retryable as issued.
+    /// The `content` a `source_path` supplies on the host-folder route: the
+    /// UTF-8 text of an existing file under `rootPath`.
+    ///
+    /// `source_path` is a read, so it passes exactly the gates
+    /// `FileReadTool.execute` applies to `path` on this route, in the same
+    /// order: `FolderToolHelpers.resolvePath` (root confinement after
+    /// `..`/absolute standardisation AND after symlink resolution, so an
+    /// absolute path outside the folder, a `..` escape, or an in-folder
+    /// symlink pointing out are all rejected), then
+    /// `FolderToolHelpers.shouldRefuseSecret` (the combined-mode secret
+    /// denylist, same `secretRefusalEnvelope`), then existence. A generated
+    /// document (bytes, not text) and non-UTF-8 data are refused too. Every
+    /// refusal is returned as the envelope to hand back; none is retryable as
+    /// issued because the arguments must change.
     static func contentFromSource(
         _ sourcePath: String,
-        displayPath: String,
         rootPath: URL,
         tool: String
-    ) throws -> SourceContent {
-        let sourceURL = try FolderToolHelpers.resolvePath(sourcePath, rootPath: rootPath)
+    ) -> SourceContent {
+        let sourceURL: URL
+        do {
+            sourceURL = try FolderToolHelpers.resolvePath(sourcePath, rootPath: rootPath)
+        } catch {
+            return .failureEnvelope(
+                ToolEnvelope.failure(
+                    kind: .invalidArgs,
+                    message: "`source_path` was rejected: \(error.localizedDescription)",
+                    field: "source_path",
+                    expected: "a text file inside the working folder (relative path, no `..`, no symlink out of it)",
+                    tool: tool,
+                    retryable: false
+                )
+            )
+        }
+        if FolderToolHelpers.shouldRefuseSecret(fileURL: sourceURL) {
+            return .failureEnvelope(
+                FolderToolHelpers.secretRefusalEnvelope(relativePath: sourcePath, tool: tool)
+            )
+        }
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: sourceURL.path, isDirectory: &isDirectory),
             !isDirectory.boolValue
@@ -2722,7 +2725,7 @@ struct FileWriteTool: OsaurusTool, PermissionedTool {
                 ToolEnvelope.failure(
                     kind: .notFound,
                     message:
-                        "`source_path` '\(displayPath)' does not exist as a file. Write the text first (e.g. with "
+                        "`source_path` '\(sourcePath)' does not exist as a file. Write the text first (e.g. with "
                         + "`file_write` and `mode: \"append\"` for later parts), then render the document from it.",
                     field: "source_path",
                     expected: "relative path of an existing text file",
@@ -2730,27 +2733,14 @@ struct FileWriteTool: OsaurusTool, PermissionedTool {
                 )
             )
         }
-        let ext = sourceURL.pathExtension.lowercased()
-        if FileWriteDocumentRouting.target(forExtension: ext) != nil {
-            return .failureEnvelope(
-                ToolEnvelope.failure(
-                    kind: .invalidArgs,
-                    message:
-                        "`source_path` '\(displayPath)' is a generated .\(ext) document, not text. Point `source_path` at the "
-                        + "Markdown/HTML/CSV file the document should be built from, or read the document with `file_read` "
-                        + "and pass its text as `content`.",
-                    field: "source_path",
-                    expected: "a text file (Markdown, HTML, CSV/TSV, JSON)",
-                    tool: tool,
-                    retryable: false
-                )
-            )
+        if let refusal = documentSourceRefusal(displayPath: sourcePath, ext: sourceURL.pathExtension.lowercased(), tool: tool) {
+            return .failureEnvelope(refusal)
         }
         guard let text = try? String(contentsOf: sourceURL, encoding: .utf8) else {
             return .failureEnvelope(
                 ToolEnvelope.failure(
                     kind: .invalidArgs,
-                    message: "`source_path` '\(displayPath)' is not UTF-8 text, so it cannot be used as `content`.",
+                    message: "`source_path` '\(sourcePath)' is not UTF-8 text, so it cannot be used as `content`.",
                     field: "source_path",
                     expected: "a UTF-8 text file",
                     tool: tool,
@@ -2759,6 +2749,83 @@ struct FileWriteTool: OsaurusTool, PermissionedTool {
             )
         }
         return .text(text)
+    }
+
+    /// The `content` a `source_path` supplies on the sandbox route. The
+    /// source lives in the VM, so it is read by the sandbox's own reader,
+    /// `SandboxReadFileTool` — the same path `file_read` takes for text under
+    /// `/workspace` — which applies the VM path sanitizer (agent home or
+    /// `/workspace/shared` only) and runs as the agent user. The host never
+    /// opens the VirtioFS share on the model's behalf: `file_read` serves the
+    /// share host-side only for documents and images, and a generated
+    /// document is not a valid source anyway. `max_chars: 0` is that reader's
+    /// whole-file mode (plain `cat`), so the text is never truncated. A
+    /// reader failure is returned verbatim, re-attributed to this tool and
+    /// the `source_path` field.
+    static func contentFromSandboxSource(
+        _ sourcePath: String,
+        bridge: SandboxReadBridge,
+        tool: String
+    ) async throws -> SourceContent {
+        let ext = URL(fileURLWithPath: sourcePath).pathExtension.lowercased()
+        if let refusal = documentSourceRefusal(displayPath: sourcePath, ext: ext, tool: tool) {
+            return .failureEnvelope(refusal)
+        }
+        let raw = try await sandboxBridgeReadWholeFile(bridge, path: sourcePath)
+        guard !ToolEnvelope.isError(raw) else {
+            return .failureEnvelope(reattributedSourceFailure(raw, tool: tool))
+        }
+        guard let payload = ToolEnvelope.successPayload(raw) as? [String: Any],
+            let text = payload["content"] as? String
+        else {
+            return .failureEnvelope(
+                ToolEnvelope.failure(
+                    kind: .executionError,
+                    message: "`source_path` '\(sourcePath)' could not be read as text from the sandbox.",
+                    field: "source_path",
+                    tool: tool,
+                    retryable: false
+                )
+            )
+        }
+        return .text(text)
+    }
+
+    /// A generated document is bytes, not text: refuse it as a source with
+    /// the text-file pivot instead of rendering ZIP/PDF bytes as Markdown.
+    private static func documentSourceRefusal(displayPath: String, ext: String, tool: String) -> String? {
+        guard FileWriteDocumentRouting.target(forExtension: ext) != nil else { return nil }
+        return ToolEnvelope.failure(
+            kind: .invalidArgs,
+            message:
+                "`source_path` '\(displayPath)' is a generated .\(ext) document, not text. Point `source_path` at the "
+                + "Markdown/HTML/CSV file the document should be built from, or read the document with `file_read` "
+                + "and pass its text as `content`.",
+            field: "source_path",
+            expected: "a text file (Markdown, HTML, CSV/TSV, JSON)",
+            tool: tool,
+            retryable: false
+        )
+    }
+
+    /// A failure envelope from the sandbox reader, re-labelled with this
+    /// tool's name and the `source_path` field; kind, message and
+    /// retryability are the reader's own.
+    private static func reattributedSourceFailure(_ raw: String, tool: String) -> String {
+        guard let data = raw.data(using: .utf8),
+            var object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else { return raw }
+        object["tool"] = tool
+        object["field"] = "source_path"
+        // A sanitizer/argument rejection is deterministic for these
+        // arguments (same rule as the host route): the path must change.
+        if object["kind"] as? String == ToolEnvelope.Kind.invalidArgs.rawValue {
+            object["retryable"] = false
+        }
+        guard let encoded = try? JSONSerialization.data(withJSONObject: object, options: .osaurusCanonical),
+            let result = String(data: encoded, encoding: .utf8)
+        else { return raw }
+        return result
     }
 
     /// `content` parsed as a `file_edit` operations array: a JSON array
