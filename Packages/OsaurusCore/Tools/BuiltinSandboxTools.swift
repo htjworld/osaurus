@@ -2046,11 +2046,8 @@ internal struct SandboxWriteFileTool: OsaurusTool, @unchecked Sendable {
                 ]),
                 "content": .object([
                     "type": .string("string"),
-                    "maxLength": .number(
-                        Double(WorkspaceToolContract.maxWriteContentCharacters)
-                    ),
                     "description": .string(
-                        "Whole-file contents (maximum \(WorkspaceToolContract.maxWriteContentCharacters) characters per call; use append for more). Pass `\"\"` for an empty file. Omit when editing via `old_string`. Binary / NUL bytes are not safe — they ride a `printf` shell pipeline."
+                        "Whole-file contents (any length). Pass `\"\"` for an empty file. Omit when editing via `old_string`. Binary / NUL bytes are not safe — they ride a `printf` shell pipeline."
                     ),
                 ]),
                 "mode": .object([
@@ -2186,6 +2183,37 @@ internal struct SandboxWriteFileTool: OsaurusTool, @unchecked Sendable {
         return try await writeWhole(args: args, resolved: resolved)
     }
 
+    /// Largest quoted `printf` payload (UTF-8 bytes after single-quote
+    /// escaping) sent in one shell command. The whole command is one `sh -c`
+    /// argv string, and the Linux kernel refuses a single argv string above
+    /// 128 KiB (`MAX_ARG_STRLEN`) with "Argument list too long" — so a
+    /// larger `content` is written as a sequence of appends. This bounds one
+    /// shell command, not the content.
+    static let shellWritePartBytes = 96 * 1024
+
+    /// `content` split into consecutive parts whose escaped form each fit in
+    /// one `printf` command; splits fall on character boundaries so UTF-8
+    /// sequences are never cut. Empty content is one empty part.
+    static func shellWriteParts(_ content: String) -> [String] {
+        guard !content.isEmpty else { return [""] }
+        var parts: [String] = []
+        var current = ""
+        var currentBytes = 0
+        for character in content {
+            // `'` becomes `'\''` under `shellEscapeSingleQuoted`.
+            let bytes = character == "'" ? 4 : character.utf8.count
+            if currentBytes + bytes > shellWritePartBytes, !current.isEmpty {
+                parts.append(current)
+                current = ""
+                currentBytes = 0
+            }
+            current.append(character)
+            currentBytes += bytes
+        }
+        if !current.isEmpty { parts.append(current) }
+        return parts
+    }
+
     /// Whole-file write branch. Empty content is legitimate (truncate-to-zero).
     private func writeWhole(args: [String: Any], resolved: String) async throws -> String {
         let contentReq = requireString(
@@ -2235,19 +2263,26 @@ internal struct SandboxWriteFileTool: OsaurusTool, @unchecked Sendable {
         // Append must not depend on the best-effort diff pre-read. A transient
         // read failure used to turn `before` into an empty string and then
         // overwrite the existing file with only the new chunk.
-        let escaped = shellEscapeSingleQuoted(content)
-        let redirect = mode == "append" ? ">>" : ">"
-        let result = try await SandboxToolCommandRunnerRegistry.shared.execAsAgent(
-            agentName,
-            command: "printf '%s' '\(escaped)' \(redirect) '\(resolved)'"
-        )
-        guard result.succeeded else {
-            return sandboxExecutionFailure(
-                tool: name,
-                message:
-                    "Failed to write `\(resolved)`: "
-                    + result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        // The content rides the command line, which the VM kernel caps per
+        // argv string; a large write is issued as consecutive appends so the
+        // size of `content` never decides whether the write succeeds.
+        let parts = Self.shellWriteParts(content)
+        for (index, part) in parts.enumerated() {
+            let escaped = shellEscapeSingleQuoted(part)
+            let redirect = (index == 0 && mode != "append") ? ">" : ">>"
+            let result = try await SandboxToolCommandRunnerRegistry.shared.execAsAgent(
+                agentName,
+                command: "printf '%s' '\(escaped)' \(redirect) '\(resolved)'"
             )
+            guard result.succeeded else {
+                let position = parts.count > 1 ? " (part \(index + 1) of \(parts.count))" : ""
+                return sandboxExecutionFailure(
+                    tool: name,
+                    message:
+                        "Failed to write `\(resolved)`\(position): "
+                        + result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+                )
+            }
         }
         return sandboxSuccess(
             tool: name,

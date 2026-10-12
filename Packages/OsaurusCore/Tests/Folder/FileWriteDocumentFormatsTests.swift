@@ -294,7 +294,151 @@ struct FileWriteDocumentFormatsTests {
         )
         #expect(ToolEnvelope.isError(result))
         #expect(EnvelopeAssertions.failureField(result) == "mode")
+        let message = EnvelopeAssertions.failureMessage(result) ?? ""
+        #expect(message.contains("file_read"))
+        // The refusal must name the way out for a large document: whole
+        // content of any length, or render from an assembled text file.
+        #expect(message.contains("source_path"))
+    }
+
+    // MARK: - Large documents
+
+    /// Markdown well above the old 30,000-character cap: ~110 numbered
+    /// sections so the body is prose, not one long token. The exact size
+    /// a user hit ("got 34172") sits inside this range.
+    private func largeMarkdown(minimumCharacters: Int) -> String {
+        var text = "# Field Report\n\nThis report was assembled from an 80 KB source file.\n\n"
+        var section = 1
+        while text.count < minimumCharacters {
+            text += "## Section \(section)\n\n"
+            text += "Finding \(section): the measured value stayed within tolerance across every run, "
+            text += "and the follow-up actions are listed below for the owning team to confirm.\n\n"
+            text += "- Action item \(section).1 — verify the baseline\n"
+            text += "- Action item \(section).2 — record the receipt\n\n"
+            section += 1
+        }
+        return text
+    }
+
+    @Test func docxLargerThanThirtyThousandCharactersIsGenerated() async throws {
+        DocumentAdaptersBootstrap.registerBuiltIns()
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let markdown = largeMarkdown(minimumCharacters: 34_172)
+        #expect(markdown.count > 30_000)
+        let result = try await write(root, ["path": "report.docx", "content": markdown])
+        #expect(ToolEnvelope.isSuccess(result), "large docx write failed: \(result)")
+        let payload = try #require(EnvelopeAssertions.successPayload(result))
+        #expect(payload["format"] as? String == "docx")
+        #expect(payload["characters"] as? Int == markdown.count)
+
+        let bytes = try Data(contentsOf: root.appendingPathComponent("report.docx"))
+        #expect(bytes.prefix(2) == Data([0x50, 0x4B]), "docx is not a ZIP package")
+
+        let readBack = try await read(root, "report.docx", extra: ["max_chars": 60_000])
+        #expect(ToolEnvelope.isSuccess(readBack), "large docx read-back failed: \(readBack)")
+        let text = (EnvelopeAssertions.successPayload(readBack)?["text"] as? String) ?? ""
+        #expect(text.contains("Field Report"))
+        #expect(text.contains("Finding 1:"))
+        #expect(text.contains("Action item 100.2"), "late sections missing from the rendered document")
+    }
+
+    @Test func pdfLargerThanThirtyThousandCharactersIsGenerated() async throws {
+        DocumentAdaptersBootstrap.registerBuiltIns()
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let markdown = largeMarkdown(minimumCharacters: 34_172)
+        let result = try await write(root, ["path": "report.pdf", "content": markdown])
+        #expect(ToolEnvelope.isSuccess(result), "large pdf write failed: \(result)")
+        let payload = try #require(EnvelopeAssertions.successPayload(result))
+        #expect(payload["format"] as? String == "pdf")
+        #expect((payload["pages"] as? Int ?? 0) > 1, "a 34K-character PDF should span several pages")
+
+        let bytes = try Data(contentsOf: root.appendingPathComponent("report.pdf"))
+        #expect(bytes.prefix(4) == Data("%PDF".utf8), "pdf header missing")
+
+        let readBack = try await read(root, "report.pdf", extra: ["max_chars": 60_000])
+        #expect(ToolEnvelope.isSuccess(readBack), "large pdf read-back failed: \(readBack)")
+        let text = (EnvelopeAssertions.successPayload(readBack)?["text"] as? String) ?? ""
+        #expect(text.contains("Field Report"))
+        #expect(text.contains("Finding 1"))
+    }
+
+    // MARK: - source_path
+
+    /// The user-report shape: Markdown assembled with overwrite + append
+    /// calls, then rendered to .docx from that file instead of being
+    /// re-sent as `content`.
+    @Test func docxFromSourcePathRendersAnAppendedMarkdownFile() async throws {
+        DocumentAdaptersBootstrap.registerBuiltIns()
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let markdown = largeMarkdown(minimumCharacters: 34_172)
+        let midpoint = markdown.index(markdown.startIndex, offsetBy: markdown.count / 2)
+        let first = String(markdown[..<midpoint])
+        let second = String(markdown[midpoint...])
+        let part1 = try await write(root, ["path": "report.md", "content": first])
+        #expect(ToolEnvelope.isSuccess(part1), "\(part1)")
+        let part2 = try await write(root, ["path": "report.md", "content": second, "mode": "append"])
+        #expect(ToolEnvelope.isSuccess(part2), "\(part2)")
+        #expect((try String(contentsOf: root.appendingPathComponent("report.md"), encoding: .utf8)) == markdown)
+
+        let preview = try await write(root, ["path": "report.docx", "source_path": "report.md", "dry_run": true])
+        #expect(ToolEnvelope.isSuccess(preview), "\(preview)")
+        #expect(EnvelopeAssertions.successPayload(preview)?["characters"] as? Int == markdown.count)
+        #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("report.docx").path))
+
+        let result = try await write(root, ["path": "report.docx", "source_path": "report.md"])
+        #expect(ToolEnvelope.isSuccess(result), "docx from source_path failed: \(result)")
+        let payload = try #require(EnvelopeAssertions.successPayload(result))
+        #expect(payload["kind"] as? String == "document_write_result")
+        #expect(payload["format"] as? String == "docx")
+        #expect(payload["input"] as? String == "markdown")
+        #expect(payload["characters"] as? Int == markdown.count)
+
+        let readBack = try await read(root, "report.docx", extra: ["max_chars": 60_000])
+        #expect(ToolEnvelope.isSuccess(readBack), "docx read-back failed: \(readBack)")
+        let text = (EnvelopeAssertions.successPayload(readBack)?["text"] as? String) ?? ""
+        #expect(text.contains("Field Report"))
+        #expect(text.contains("Action item 100.2"))
+        // The source Markdown is untouched.
+        #expect((try String(contentsOf: root.appendingPathComponent("report.md"), encoding: .utf8)) == markdown)
+    }
+
+    @Test func pdfFromSourcePathRendersWorkspaceMarkdown() async throws {
+        DocumentAdaptersBootstrap.registerBuiltIns()
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try "# Launch Plan\n\nShip the beta on Friday.\n".write(
+            to: root.appendingPathComponent("plan.md"), atomically: true, encoding: .utf8)
+
+        let result = try await write(root, ["path": "out/plan.pdf", "source_path": "plan.md"])
+        #expect(ToolEnvelope.isSuccess(result), "pdf from source_path failed: \(result)")
+        let bytes = try Data(contentsOf: root.appendingPathComponent("out/plan.pdf"))
+        #expect(bytes.prefix(4) == Data("%PDF".utf8))
+        let readBack = try await read(root, "out/plan.pdf")
+        let text = (EnvelopeAssertions.successPayload(readBack)?["text"] as? String) ?? ""
+        #expect(text.contains("Launch Plan"))
+    }
+
+    /// A generated document is bytes, not text: pointing `source_path` at
+    /// one is refused with the text-file pivot instead of rendering ZIP
+    /// bytes as Markdown.
+    @Test func sourcePathMustBeATextFile() async throws {
+        DocumentAdaptersBootstrap.registerBuiltIns()
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let seed = try await write(root, ["path": "a.docx", "content": "# A"])
+        #expect(ToolEnvelope.isSuccess(seed), "\(seed)")
+
+        let result = try await write(root, ["path": "b.pdf", "source_path": "a.docx"])
+        #expect(ToolEnvelope.isError(result))
+        #expect(EnvelopeAssertions.failureField(result) == "source_path")
         #expect((EnvelopeAssertions.failureMessage(result) ?? "").contains("file_read"))
+        #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("b.pdf").path))
     }
 
     @Test func overwritingBinaryDocumentIsUndoableByteForByte() async throws {
